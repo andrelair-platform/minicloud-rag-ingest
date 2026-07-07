@@ -1,0 +1,9 @@
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+  name: minicloud-rag-ingest
+  description: Redirects to the component entry in minicloud-gitops catalog
+spec:
+  type: url
+  targets:
+    - https://raw.githubusercontent.com/andrelair-platform/minicloud-gitops/main/catalog-info.yaml
