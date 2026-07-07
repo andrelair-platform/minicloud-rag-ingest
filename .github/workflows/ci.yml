@@ -1,0 +1,85 @@
+name: Build and Push
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  HARBOR_REGISTRY: harbor.devandre.sbs
+  IMAGE_NAME: library/rag-ingest
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: meta
+        run: echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Harbor
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.HARBOR_REGISTRY }}
+          username: ${{ secrets.HARBOR_USER }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: |
+            ${{ env.HARBOR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha }}-amd64
+            ${{ env.HARBOR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install Cosign
+        if: github.ref == 'refs/heads/main'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cosign sign --yes \
+            ${{ env.HARBOR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+      - name: Update image tag in minicloud-gitops
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          NEW_TAG: ${{ steps.meta.outputs.sha }}-amd64
+        run: |
+          git clone https://x-access-token:${GH_TOKEN}@github.com/andrelair-platform/minicloud-gitops.git
+          cd minicloud-gitops
+          git config user.name 'AndreLiar'
+          git config user.email 'andrelaurelyvan.kanmegnetabouguie@ynov.com'
+
+          import-gpg() { echo "$GPG_PRIVATE_KEY" | gpg --batch --import; }
+          import-gpg 2>/dev/null || true
+
+          sed -i "s|harbor.devandre.sbs/library/rag-ingest:.*|harbor.10.0.0.200.nip.io/library/rag-ingest:${NEW_TAG}|g" \
+            manifests/ai/11-rag-ingest.yaml
+
+          git add manifests/ai/11-rag-ingest.yaml
+          git diff --cached --quiet || \
+            git commit -S -m "ci(rag-ingest): bump image to ${NEW_TAG}"
+          git push
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
