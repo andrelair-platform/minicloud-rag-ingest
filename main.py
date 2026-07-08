@@ -122,21 +122,31 @@ def _make_chunk(text: str, section: str, source: str, doc_type: str) -> dict:
 
 # ── Embedding ──────────────────────────────────────────────────────────────────
 
-def embed(text: str) -> list[float]:
-    resp = _embed_client.embeddings.create(model=EMBED_MODEL, input=text)
-    return resp.data[0].embedding
+EMBED_BATCH_SIZE = 64  # max texts per LiteLLM→Ollama call; keeps payload < ~128KB
+
+def embed_batch(texts: list[str]) -> list[list[float]]:
+    vectors: list[list[float]] = []
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[i : i + EMBED_BATCH_SIZE]
+        resp = _embed_client.embeddings.create(model=EMBED_MODEL, input=batch)
+        batch_vecs = [d.embedding for d in sorted(resp.data, key=lambda d: d.index)]
+        vectors.extend(batch_vecs)
+    return vectors
 
 
 # ── Storage ────────────────────────────────────────────────────────────────────
 
 def store_chunks(chunks: list[dict], collection: str) -> int:
+    texts = [c["text"] for c in chunks]
+    log.info("  embedding %d chunks in batches of %d …", len(texts), EMBED_BATCH_SIZE)
+    vectors = embed_batch(texts)
+
     conn = psycopg2.connect(
         host=PG_HOST, port=PG_PORT, dbname=PG_DB,
         user=PG_USER, password=PG_PASSWORD,
     )
     cur = conn.cursor()
-    for chunk in chunks:
-        vector = embed(chunk["text"])
+    for chunk, vector in zip(chunks, vectors):
         cur.execute(
             """
             INSERT INTO document_chunk (id, collection_name, text, vector, vmetadata)
