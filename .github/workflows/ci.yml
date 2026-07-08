@@ -9,6 +9,7 @@ on:
 env:
   HARBOR_REGISTRY: harbor.devandre.sbs
   IMAGE_NAME: library/rag-ingest
+  GITOPS_IMAGE: harbor.10.0.0.200.nip.io/library/rag-ingest
 
 jobs:
   build-and-push:
@@ -81,7 +82,9 @@ jobs:
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import 2>/dev/null || true
           git config commit.gpgsign true
           git config user.signingkey FD6D39D681DEFA34
-          sed -i "s|harbor.devandre.sbs/library/rag-ingest:.*|harbor.10.0.0.200.nip.io/library/rag-ingest:${NEW_TAG}|g" \
+          # Match any harbor registry prefix so the pattern works regardless of
+          # whether the manifest was last updated by CI (devandre.sbs) or manually (nip.io)
+          sed -i "s|harbor\.[^/]*/library/rag-ingest:.*|${GITOPS_IMAGE}:${NEW_TAG}|g" \
             manifests/ai/11-rag-ingest.yaml
           git add manifests/ai/11-rag-ingest.yaml
           git diff --cached --quiet || \
