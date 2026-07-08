@@ -32,15 +32,19 @@ import psycopg2
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
+from openai import OpenAI
 
-PROXY_URL   = os.environ["PROXY_URL"]    # markitdown-proxy.ai.svc.cluster.local:8000
-OLLAMA_URL  = os.environ["OLLAMA_URL"]   # ollama.ai.svc.cluster.local:11434
-PG_HOST     = os.environ["PG_HOST"]      # postgresql-ai.ai.svc.cluster.local
-PG_PORT     = int(os.getenv("PG_PORT", "5432"))
-PG_DB       = os.getenv("PG_DB", "ragdb")
-PG_USER     = os.getenv("PG_USER", "aiplatform")
-PG_PASSWORD = os.environ["PG_PASSWORD"]
-EMBED_MODEL = "bge-m3"
+PROXY_URL        = os.environ["PROXY_URL"]         # markitdown-proxy.ai.svc.cluster.local:8000
+LITELLM_BASE_URL = os.environ["LITELLM_BASE_URL"]  # http://litellm.ai.svc.cluster.local:4000
+LITELLM_API_KEY  = os.environ["LITELLM_API_KEY"]
+PG_HOST          = os.environ["PG_HOST"]           # postgresql-ai.ai.svc.cluster.local
+PG_PORT          = int(os.getenv("PG_PORT", "5432"))
+PG_DB            = os.getenv("PG_DB", "ragdb")
+PG_USER          = os.getenv("PG_USER", "aiplatform")
+PG_PASSWORD      = os.environ["PG_PASSWORD"]
+EMBED_MODEL      = "bge-m3"
+
+_embed_client = OpenAI(api_key=LITELLM_API_KEY, base_url=f"{LITELLM_BASE_URL}/v1")
 
 MAX_CHUNK_CHARS = 2000
 
@@ -118,13 +122,8 @@ def _make_chunk(text: str, section: str, source: str, doc_type: str) -> dict:
 # ── Embedding ──────────────────────────────────────────────────────────────────
 
 def embed(text: str) -> list[float]:
-    resp = requests.post(
-        f"{OLLAMA_URL}/api/embeddings",
-        json={"model": EMBED_MODEL, "prompt": text},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json()["embedding"]
+    resp = _embed_client.embeddings.create(model=EMBED_MODEL, input=text)
+    return resp.data[0].embedding
 
 
 # ── Storage ────────────────────────────────────────────────────────────────────
