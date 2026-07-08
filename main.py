@@ -43,7 +43,7 @@ PG_PORT          = int(os.getenv("PG_PORT", "5432"))
 PG_DB            = os.getenv("PG_DB", "ragdb")
 PG_USER          = os.getenv("PG_USER", "aiplatform")
 PG_PASSWORD      = os.environ["PG_PASSWORD"]
-EMBED_MODEL      = "bge-m3"
+EMBED_MODEL      = "text-embedding-3-small"
 
 _embed_client = OpenAI(api_key=LITELLM_API_KEY, base_url=f"{LITELLM_BASE_URL}/v1")
 
