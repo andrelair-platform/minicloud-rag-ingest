@@ -20,6 +20,7 @@ API
   GET  /ready
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -203,9 +204,9 @@ async def ingest(
     chunks = chunk_by_structure(markdown, source, doc_type)
     log.info("  chunked  → %d structural chunks", len(chunks))
 
-    # 3. Embed + store
+    # 3. Embed + store — run in a thread so the event loop stays free for health probes
     try:
-        stored = store_chunks(chunks, collection)
+        stored = await asyncio.to_thread(store_chunks, chunks, collection)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Storage failed: {exc}")
     log.info("  stored   → %d chunks in ragdb collection %s", stored, collection)
