@@ -21,6 +21,7 @@
 - [CI/CD pipeline](#cicd-pipeline)
 - [Environment variables](#environment-variables)
 - [Security](#security)
+- [Related services](#related-services)
 
 ---
 
@@ -48,8 +49,9 @@ Client (curl / CI / port-forward)
 │  FastAPI · python:3.12-slim · UID 1000 · port 8001      │
 │                                                         │
 │  1. Forward file to markitdown-proxy                    │
-│     ├─ .pdf / images  →  Docling (port 5001)            │
-│     └─ .docx / .xlsx / .pptx / .html  →  MarkItDown    │
+│     ├─ images (png/jpg/tiff…) →  Docling (port 5001)   │
+│     └─ .pdf / .docx / .xlsx / .pptx / .html            │
+│                               →  MarkItDown (in-pod)    │
 │                                                         │
 │  2. Structure-aware chunker                             │
 │     Splits on: Article / Chapitre / Titre / Annexe      │
@@ -74,11 +76,17 @@ ai namespace · port 8000    ai namespace · port 5432
 
 **In-cluster DNS names used at runtime:**
 
-| Dependency | Address |
-|---|---|
-| markitdown-proxy | `http://markitdown-proxy.ai.svc.cluster.local:8000` |
-| LiteLLM (embeddings) | `http://litellm.ai.svc.cluster.local:4000` |
-| PostgreSQL / ragdb | `postgresql-ai.ai.svc.cluster.local:5432` |
+| Dependency | Address | Source |
+|---|---|---|
+| markitdown-proxy | `http://markitdown-proxy.ai.svc.cluster.local:8000` | [`minicloud-markitdown-proxy`](https://github.com/andrelair-platform/minicloud-markitdown-proxy) — custom service |
+| LiteLLM (embeddings) | `http://litellm.ai.svc.cluster.local:4000` | Helm — `manifests/ai/` in minicloud-gitops |
+| PostgreSQL / ragdb | `postgresql-ai.ai.svc.cluster.local:5432` | Helm — `manifests/ai/` in minicloud-gitops |
+
+**markitdown-proxy** itself calls a third service for scanned images:
+
+| Dependency | Address | Source |
+|---|---|---|
+| Docling (OCR, images only) | `http://docling.ai.svc.cluster.local:5001` | Helm — `ghcr.io/docling-project/docling-serve-cpu:v1.26.0`, deployed via `manifests/ai/` in minicloud-gitops; 4.4 GB CPU image, bundles all model weights, no internet egress at runtime |
 
 ---
 
@@ -118,10 +126,10 @@ doc_type    optional   Document type tag (default: policy)
 
 | Format | Conversion path |
 |---|---|
-| `.pdf` | markitdown-proxy → Docling OCR |
-| `.png` `.jpg` `.jpeg` `.tiff` `.bmp` `.gif` `.webp` | markitdown-proxy → Docling OCR |
-| `.docx` `.xlsx` `.pptx` `.html` | markitdown-proxy → MarkItDown |
-| `.txt` `.md` | markitdown-proxy → MarkItDown passthrough |
+| `.png` `.jpg` `.jpeg` `.tiff` `.bmp` `.gif` `.webp` | [markitdown-proxy](https://github.com/andrelair-platform/minicloud-markitdown-proxy) → Docling (OCR — scanned images only) |
+| `.pdf` | [markitdown-proxy](https://github.com/andrelair-platform/minicloud-markitdown-proxy) → MarkItDown (PyMuPDF — fast, no layout analysis overhead) |
+| `.docx` `.xlsx` `.pptx` `.html` | [markitdown-proxy](https://github.com/andrelair-platform/minicloud-markitdown-proxy) → MarkItDown |
+| `.txt` `.md` | [markitdown-proxy](https://github.com/andrelair-platform/minicloud-markitdown-proxy) → MarkItDown passthrough |
 
 ### `GET /health`
 
@@ -281,3 +289,14 @@ All required variables are injected at runtime via a Kubernetes Secret managed b
 - **Network isolation** — the `ai` namespace has default-deny ingress + egress NetworkPolicies; rag-ingest can only reach its declared dependencies (markitdown-proxy, LiteLLM, PostgreSQL) and is not exposed to the internet
 - **No credentials in code** — all secrets injected via ESO + Vault at pod startup; zero hardcoded values
 - **GitOps delivery** — no direct `kubectl apply`; all deploys go through ArgoCD with audit trail
+
+---
+
+## Related services
+
+| Service | Repo | Role in the pipeline |
+|---|---|---|
+| **markitdown-proxy** | [`minicloud-markitdown-proxy`](https://github.com/andrelair-platform/minicloud-markitdown-proxy) | Document conversion layer — routes scanned images to Docling (OCR) and all other formats to MarkItDown in-pod; exposes the Docling-compatible `/v1/convert/file` API |
+| **Docling** | deployed via Helm in `ai` namespace | OCR backend for scanned images only — `ghcr.io/docling-project/docling-serve-cpu:v1.26.0`; 4.4 GB CPU image, all model weights bundled, zero internet egress at runtime; manifest at `manifests/ai/` in [minicloud-gitops](https://github.com/andrelair-platform/minicloud-gitops) |
+| **LiteLLM** | deployed via Helm in `ai` namespace | Embedding gateway — routes `text-embedding-3-small` calls to the cloud or local Ollama; manifest in minicloud-gitops |
+| **postgresql-ai / ragdb** | deployed via Helm in `ai` namespace | pgvector store — `document_chunk` table with HNSW vector index + GIN FTS index (`french` dictionary) |
