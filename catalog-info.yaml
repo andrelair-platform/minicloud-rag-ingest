@@ -1,9 +1,132 @@
+---
 apiVersion: backstage.io/v1alpha1
-kind: Location
+kind: Component
 metadata:
-  name: minicloud-rag-ingest
-  description: Redirects to the component entry in minicloud-gitops catalog
+  name: rag-ingest
+  description: |
+    Custom RAG ingestion pipeline. Accepts file uploads, converts via
+    markitdown-proxy, splits on French insurance structural boundaries
+    (article/section headings), embeds with bge-m3 via Ollama, and inserts
+    directly into ragdb (pgvector). Eliminates the need for Mac-side tools.
+  annotations:
+    backstage.io/source-location: url:https://github.com/andrelair-platform/minicloud-rag-ingest
+    github.com/project-slug: andrelair-platform/minicloud-rag-ingest
+    argocd/app-name: ai-manifests
+    backstage.io/kubernetes-id: rag-ingest
+  tags:
+    - ai
+    - rag
+    - custom
+  links:
+    - url: https://github.com/andrelair-platform/minicloud-rag-ingest
+      title: Source Repository
+      icon: github
+    - url: https://argocd.devandre.sbs/applications/ai-manifests
+      title: ArgoCD Application
+      icon: dashboard
 spec:
-  type: url
-  targets:
-    - https://raw.githubusercontent.com/andrelair-platform/minicloud-gitops/main/catalog-info.yaml
+  type: service
+  lifecycle: production
+  owner: andrelair-platform
+  system: minicloud-platform
+  providesApis:
+    - rag-ingest-api
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: rag-ingest-api
+  description: |
+    RAG ingestion API. Accepts document uploads, converts via markitdown-proxy,
+    chunks on French insurance heading boundaries, embeds with bge-m3, and
+    inserts into ragdb (pgvector). Internal cluster service only.
+  annotations:
+    backstage.io/source-location: url:https://github.com/andrelair-platform/minicloud-rag-ingest
+  tags:
+    - ai
+    - rag
+    - openapi
+spec:
+  type: openapi
+  lifecycle: production
+  owner: andrelair-platform
+  system: minicloud-platform
+  definition: |
+    openapi: "3.1.0"
+    info:
+      title: rag-ingest
+      version: "0.1.0"
+      description: >
+        RAG ingestion pipeline: convert → chunk → embed (bge-m3) → pgvector INSERT.
+        Internal cluster service at rag-ingest.ai.svc.cluster.local:8001.
+    paths:
+      /health:
+        get:
+          summary: Health check
+          responses:
+            "200":
+              description: Service is healthy
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      status:
+                        type: string
+                        example: ok
+      /ready:
+        get:
+          summary: Readiness check
+          responses:
+            "200":
+              description: Service is ready to accept requests
+      /ingest:
+        post:
+          summary: Ingest a document into pgvector
+          description: >
+            Converts the uploaded file via markitdown-proxy, splits on French
+            insurance structural headings, embeds each chunk with bge-m3 via
+            Ollama, and inserts into the specified Open WebUI knowledge base
+            collection in ragdb.
+          requestBody:
+            required: true
+            content:
+              multipart/form-data:
+                schema:
+                  type: object
+                  required:
+                    - file
+                    - collection
+                    - source
+                  properties:
+                    file:
+                      type: string
+                      format: binary
+                      description: Document to ingest (PDF, DOCX, XLSX, PPTX, TXT, MD)
+                    collection:
+                      type: string
+                      description: Open WebUI Knowledge Base UUID (collection_name in ragdb)
+                    source:
+                      type: string
+                      description: Human-readable document title for metadata
+                    doc_type:
+                      type: string
+                      default: policy
+                      enum: [policy, endorsement, annexe, regulatory, tariff, internal]
+                      description: Document type tag stored in chunk metadata
+          responses:
+            "200":
+              description: Ingestion completed
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      chunks_inserted:
+                        type: integer
+                      collection:
+                        type: string
+                      source:
+                        type: string
+            "422":
+              description: Validation error (missing required fields)
