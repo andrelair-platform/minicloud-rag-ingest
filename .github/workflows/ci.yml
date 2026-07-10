@@ -7,7 +7,7 @@ on:
     branches: [main, staging]
 
 env:
-  HARBOR_REGISTRY: harbor.devandre.sbs
+  HARBOR_REGISTRY: harbor.10.0.0.200.nip.io
   IMAGE_NAME: library/rag-ingest
   GITOPS_IMAGE: harbor.10.0.0.200.nip.io/library/rag-ingest
 
@@ -36,8 +36,29 @@ jobs:
           echo "tag=${TAG}"       >> $GITHUB_OUTPUT
           echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
 
+      # ── Tailscale: join the minicloud tailnet so we can reach Harbor ────────
+      - name: Connect to Tailscale
+        if: github.event_name == 'push'
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          version: latest
+
+      # ── Trust the minicloud self-signed CA so Docker accepts Harbor TLS ────
+      - name: Trust minicloud CA
+        if: github.event_name == 'push'
+        run: |
+          sudo mkdir -p /etc/docker/certs.d/${{ env.HARBOR_REGISTRY }}
+          echo "${{ secrets.MINICLOUD_CA_CERT }}" | sudo tee /etc/docker/certs.d/${{ env.HARBOR_REGISTRY }}/ca.crt
+          echo "${{ secrets.MINICLOUD_CA_CERT }}" | sudo tee /usr/local/share/ca-certificates/minicloud-ca.crt
+          sudo update-ca-certificates
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."harbor.10.0.0.200.nip.io"]
+              insecure = true
 
       - name: Login to Harbor
         if: github.event_name == 'push'
@@ -82,8 +103,6 @@ jobs:
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import 2>/dev/null || true
           git config commit.gpgsign true
           git config user.signingkey FD6D39D681DEFA34
-          # Match any harbor registry prefix so the pattern works regardless of
-          # whether the manifest was last updated by CI (devandre.sbs) or manually (nip.io)
           sed -i "s|harbor\.[^/]*/library/rag-ingest:.*|${GITOPS_IMAGE}:${NEW_TAG}|g" \
             manifests/ai/11-rag-ingest.yaml
           git add manifests/ai/11-rag-ingest.yaml
