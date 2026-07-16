@@ -1,6 +1,7 @@
 # minicloud-rag-ingest
 
 [![CI](https://github.com/andrelair-platform/minicloud-rag-ingest/actions/workflows/ci.yml/badge.svg)](https://github.com/andrelair-platform/minicloud-rag-ingest/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Supply chain: cosign](https://img.shields.io/badge/supply%20chain-cosign%20signed-green)](https://github.com/sigstore/cosign)
 [![Python](https://img.shields.io/badge/Python-3.12-blue)](https://www.python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-teal)](https://fastapi.tiangolo.com)
@@ -21,7 +22,9 @@
 - [CI/CD pipeline](#cicd-pipeline)
 - [Environment variables](#environment-variables)
 - [Security](#security)
+- [Troubleshooting](#troubleshooting)
 - [Related services](#related-services)
+- [License](#license)
 
 ---
 
@@ -236,11 +239,12 @@ Every push to `main` triggers `.github/workflows/ci.yml`:
 ```
 push to main
     │
-    ├─ 1. Connect to Tailscale tailnet (reach Harbor registry directly over LAN)
-    ├─ 2. Trust minicloud self-signed CA (Docker daemon + cosign + crane)
+    ├─ 1. Connect to Tailscale (OAuth — TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET)
+    ├─ 2. Trust minicloud CA (raw PEM — no base64 decode)
     ├─ 3. docker build → push to harbor.10.0.0.200.nip.io/library/rag-ingest:<sha>-amd64
-    ├─ 4. cosign sign (keyless — GitHub OIDC → Sigstore Fulcio)
-    └─ 5. GPG-signed commit to minicloud-gitops bumping manifests/ai/11-rag-ingest.yaml
+    ├─ 4. Trivy scan — fails on unfixed CRITICAL CVEs
+    ├─ 5. cosign sign (keyless — GitHub OIDC → Sigstore Fulcio)
+    └─ 6. GPG-signed commit to minicloud-gitops bumping manifests/ai/11-rag-ingest.yaml
               └─ ArgoCD webhook → rolling update in ai namespace
 ```
 
@@ -254,9 +258,12 @@ push to main
 
 **Required repository secrets:**
 
+All 7 secrets are **org-level on `andrelair-platform`** (visibility: all). New repos inherit them automatically — no per-repo setup needed.
+
 | Secret | Purpose |
 |---|---|
-| `TAILSCALE_AUTH_KEY` | Ephemeral auth key to join the Tailscale tailnet |
+| `TS_OAUTH_CLIENT_ID` | Tailscale OAuth client ID — joins tailnet as `tag:ci` |
+| `TS_OAUTH_SECRET` | Tailscale OAuth secret |
 | `MINICLOUD_CA_CERT` | Self-signed CA PEM — lets Docker and cosign trust Harbor TLS |
 | `HARBOR_USER` | Harbor registry username |
 | `HARBOR_PASSWORD` | Harbor registry password |
@@ -292,6 +299,19 @@ All required variables are injected at runtime via a Kubernetes Secret managed b
 
 ---
 
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `POST /ingest` returns 502 | `markitdown-proxy` not reachable | Check `kubectl get pods -n ai` — markitdown-proxy must be Running; verify NetworkPolicy allows ai→ai traffic |
+| Response shows `chunks_stored: 0` | Document converted to empty Markdown | Check markitdown-proxy logs — the file may be a scanned image without text; try a PDF with selectable text |
+| LiteLLM embedding call fails | LiteLLM pod unreachable or API key expired | Check `kubectl logs -n ai -l app=rag-ingest`; port-forward LiteLLM and verify the API key |
+| pgvector `INSERT` fails | `document_chunk` table or index missing | Run schema migration in `postgresql-ai` — check `migrations/` for the CREATE TABLE statement |
+| CI fails: Harbor push rejected | Runner not on Tailscale tailnet | Ensure Tailscale OAuth step runs before Docker login |
+| Long ingest time for a large PDF | Expecting Docling OCR overhead | rag-ingest routes PDFs to MarkItDown (PyMuPDF), not Docling — check markitdown-proxy routing logic |
+
+---
+
 ## Related services
 
 | Service | Repo | Role in the pipeline |
@@ -300,3 +320,9 @@ All required variables are injected at runtime via a Kubernetes Secret managed b
 | **Docling** | deployed via Helm in `ai` namespace | OCR backend for scanned images only — `ghcr.io/docling-project/docling-serve-cpu:v1.26.0`; 4.4 GB CPU image, all model weights bundled, zero internet egress at runtime; manifest at `manifests/ai/` in [minicloud-gitops](https://github.com/andrelair-platform/minicloud-gitops) |
 | **LiteLLM** | deployed via Helm in `ai` namespace | Embedding gateway — routes `text-embedding-3-small` calls to the cloud or local Ollama; manifest in minicloud-gitops |
 | **postgresql-ai / ragdb** | deployed via Helm in `ai` namespace | pgvector store — `document_chunk` table with HNSW vector index + GIN FTS index (`french` dictionary) |
+
+---
+
+## License
+
+[MIT](LICENSE) © andrelair-platform
