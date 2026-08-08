@@ -6,7 +6,7 @@ RUN pip install --no-cache-dir \
     fastapi==0.115.6 \
     uvicorn[standard]==0.32.1 \
     requests==2.32.3 \
-    psycopg2-binary==2.9.10 \
+    qdrant-client==1.9.1 \
     python-multipart==0.0.12 \
     openai==1.97.0
 
