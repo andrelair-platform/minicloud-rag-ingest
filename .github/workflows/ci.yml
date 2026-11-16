@@ -1,119 +1,68 @@
-name: Build and Push
+name: CI
 
+# ghcr-only (Harbor decommissioned 2026-11-16). Build+push to ghcr + cosign/SBOM. Login via GITOPS_TOKEN
+# (write:packages; the package is linked to minicloud-gitops from the decommission crane-copy). The old
+# Harbor auto-bump is dropped (it sed'd manifests/ paths LOT E moved to platform/+is/; dead since 2026-10).
 on:
   push:
-    branches: [main, staging, dev]
+    branches: [main]
   pull_request:
-    branches: [main, staging]
+    branches: [main]
 
 env:
-  HARBOR_REGISTRY: harbor.10.0.0.200.nip.io
-  IMAGE_NAME: library/rag-ingest
-  GITOPS_IMAGE: harbor.10.0.0.200.nip.io/library/rag-ingest
+  GHCR_IMAGE: ghcr.io/andrelair-platform/rag-ingest
 
 jobs:
   build-and-push:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      packages: write
       id-token: write
-    outputs:
-      image_tag: ${{ steps.meta.outputs.tag }}
-
     steps:
       - uses: actions/checkout@v7
-
-      - name: Compute image tag
+        with:
+          fetch-depth: 0
+      - name: Compute build metadata
         id: meta
         run: |
           SHA=$(git rev-parse --short HEAD)
-          BRANCH=${GITHUB_REF_NAME}
-          if [ "$BRANCH" = "main" ]; then
-            TAG="${SHA}-amd64"
-          else
-            TAG="${BRANCH}-${SHA}-amd64"
-          fi
-          echo "tag=${TAG}"       >> $GITHUB_OUTPUT
-          echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
-
-      # ── Tailscale: join the minicloud tailnet so we can reach Harbor ────────
-      - name: Connect to Tailscale
-        if: github.event_name == 'push'
-        uses: tailscale/github-action@v4.1.3
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          version: latest
-
-      # ── Trust the minicloud self-signed CA so Docker accepts Harbor TLS ────
-      - name: Trust minicloud CA
-        if: github.event_name == 'push'
-        run: |
-          sudo mkdir -p /etc/docker/certs.d/${{ env.HARBOR_REGISTRY }}
-          echo "${{ secrets.MINICLOUD_CA_CERT }}" | sudo tee /etc/docker/certs.d/${{ env.HARBOR_REGISTRY }}/ca.crt
-          echo "${{ secrets.MINICLOUD_CA_CERT }}" | sudo tee /usr/local/share/ca-certificates/minicloud-ca.crt
-          sudo update-ca-certificates
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          buildkitd-config-inline: |
-            [registry."harbor.10.0.0.200.nip.io"]
-              insecure = true
-
-      - name: Login to Harbor
-        if: github.event_name == 'push'
+          echo "image_tag=${SHA}-amd64" >> "$GITHUB_OUTPUT"
+      - name: Login to GHCR
         uses: docker/login-action@v4
         with:
-          registry: ${{ env.HARBOR_REGISTRY }}
-          username: ${{ secrets.HARBOR_USER }}
-          password: ${{ secrets.HARBOR_PASSWORD }}
-
-      - name: Build and push
+          registry: ghcr.io
+          username: AndreLiar
+          password: ${{ secrets.GITOPS_TOKEN }}
+      - uses: docker/setup-buildx-action@v4
+      - name: Build and push to ghcr
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
+          push: true
           platforms: linux/amd64
-          push: ${{ github.event_name == 'push' }}
-          tags: ${{ env.HARBOR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          tags: ${{ env.GHCR_IMAGE }}:${{ steps.meta.outputs.image_tag }}
+          build-args: |
+            CA_CERT=${{ secrets.MINICLOUD_CA_CERT }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.GHCR_IMAGE }}@${{ steps.build.outputs.digest }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+          ignore-unfixed: true
+          timeout: 15m
       - name: Install Cosign
-        if: github.event_name == 'push' && github.ref_name != 'dev'
         uses: sigstore/cosign-installer@v3
-
-      - name: Sign image
-        if: github.event_name == 'push' && github.ref_name != 'dev'
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+      - name: Sign image + attach SBOM (keyless)
         run: |
-          cosign sign --yes \
-            ${{ env.HARBOR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
-
-      - name: Bump gitops image tag via PR (main only)
-        if: github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          NEW_TAG: ${{ steps.meta.outputs.tag }}
-        run: |
-          git clone https://x-access-token:${GH_TOKEN}@github.com/andrelair-platform/minicloud-gitops.git
-          cd minicloud-gitops
-          git config user.name 'AndreLiar'
-          git config user.email 'andrelaurelyvan.kanmegnetabouguie@ynov.com'
-          echo "$GPG_PRIVATE_KEY" | gpg --batch --import 2>/dev/null || true
-          git config commit.gpgsign true
-          git config user.signingkey FD6D39D681DEFA34
-          sed -i "s|harbor\.[^/]*/library/rag-ingest:.*|${GITOPS_IMAGE}:${NEW_TAG}|g" \
-            manifests/ai/11-rag-ingest.yaml
-          git add manifests/ai/11-rag-ingest.yaml
-          if git diff --cached --quiet; then echo 'no manifest change; nothing to bump'; exit 0; fi
-          BRANCH="ci/bump-rag-ingest-${NEW_TAG}"
-          git checkout -b "$BRANCH"
-          git commit -S -m "ci(rag-ingest): bump image to ${NEW_TAG}"
-          git push origin "$BRANCH"
-          gh pr create --repo andrelair-platform/minicloud-gitops --base main --head "$BRANCH" \
-            --title "ci(rag-ingest): bump image to ${NEW_TAG}" \
-            --body 'Automated image bump from CI (branch protection requires a PR, not a direct push).'
-          for _ in 1 2 3 4 5; do
-            gh pr merge --repo andrelair-platform/minicloud-gitops "$BRANCH" --squash --delete-branch && break || sleep 6
-          done
+          cosign sign --yes "${{ env.GHCR_IMAGE }}@${{ steps.build.outputs.digest }}"
+          syft "${{ env.GHCR_IMAGE }}@${{ steps.build.outputs.digest }}" -o cyclonedx-json=sbom.json
+          cosign attach sbom --sbom sbom.json --type cyclonedx "${{ env.GHCR_IMAGE }}@${{ steps.build.outputs.digest }}"
