@@ -4,7 +4,7 @@
 
 > **This is the service contract for `rag-ingest` as a shared, multi-tenant platform capability.** It is
 > the operational **how** under an already-Accepted strategy: the *Document Intelligence Spine* ADR
-> (`minicloud-gitops/docs/document-intelligence-spine.md`, AI Platform #4) decided *build document
+> (`minicloud-platform-docs/docs/architecture/adr/document-intelligence-spine.md`, AI Platform #4) decided *build document
 > intelligence once as a shared horizontal spine; business domains MUST NOT re-implement RAG privately.*
 > This doc defines the contract a product consumes — one collection per product, two endpoints — and the
 > **PII-gate-at-ingest** that spine's GOVERN stage requires but that is **not yet wired in**.
@@ -113,7 +113,7 @@ currently `litellm`-only). **That netpol is the one change that lands in `minicl
 
 ## Related
 
-- Parent strategy (ADR): `minicloud-gitops/docs/document-intelligence-spine.md` (INGEST→…→GOVERN), also on
+- Parent strategy (ADR): `minicloud-platform-docs/docs/architecture/adr/document-intelligence-spine.md` (INGEST→…→GOVERN), also on
   the central docs Architecture Hub.
 - Boundary rule: `platform-vs-information-system.md` (RAG = a platform capability the IS consumes).
 - Capability register: CAP-130/132/248 (RAG / vector / publication), CAP-317 (PII masking).
