@@ -1,8 +1,11 @@
 name: CI
 
 # ghcr-only (Harbor decommissioned 2026-11-16). Build+push to ghcr + cosign/SBOM. Login via GITOPS_TOKEN
-# (write:packages; the package is linked to minicloud-gitops from the decommission crane-copy). The old
-# Harbor auto-bump is dropped (it sed'd manifests/ paths LOT E moved to platform/+is/; dead since 2026-10).
+# (write:packages; the package is linked to minicloud-gitops from the decommission crane-copy).
+# On a successful main build, `bump-gitops` opens a gitops PR bumping the pinned image tag (restores the
+# auto-bump dropped at the Harbor decommission, now ghcr-only + correct platform/ path). It OPENS a PR
+# (not direct push) — a human squash-merges to deploy (prod stays review-gated; ArgoCD then auto-syncs).
+# rag-ingest is single-env → not a Kargo candidate, hence this lightweight per-repo bump instead.
 on:
   push:
     branches: [main]
@@ -66,3 +69,41 @@ jobs:
           cosign sign --yes "${{ env.GHCR_IMAGE }}@${{ steps.build.outputs.digest }}"
           syft "${{ env.GHCR_IMAGE }}@${{ steps.build.outputs.digest }}" -o cyclonedx-json=sbom.json
           cosign attach sbom --sbom sbom.json --type cyclonedx "${{ env.GHCR_IMAGE }}@${{ steps.build.outputs.digest }}"
+
+  # Restores the dropped auto-bump: open a gitops PR pinning the just-built image. Opens a PR (not a
+  # direct push to protected main) → a human squash-merges to deploy. Tag always carries the `-amd64`
+  # suffix, so it can never parse as a YAML number (the all-digit-SHA InvalidImageName trap).
+  bump-gitops:
+    needs: build-and-push
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gitops
+        uses: actions/checkout@v7
+        with:
+          repository: andrelair-platform/minicloud-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          fetch-depth: 0
+      - name: Bump rag-ingest image tag + open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          SHORT="${COMMIT_SHA:0:7}"
+          TAG="${SHORT}-amd64"
+          FILE="platform/ai/litellm/11-rag-ingest.yaml"
+          sed -i -E "s#(image: ghcr\.io/andrelair-platform/rag-ingest:).*#\1${TAG}#" "$FILE"
+          if git diff --quiet; then
+            echo "gitops image already at ${TAG} — nothing to bump"; exit 0
+          fi
+          BRANCH="ci/rag-ingest-bump-${SHORT}"
+          git config user.name "andrelair-ci"
+          git config user.email "ci@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -am "chore(rag-ingest): bump image to ${TAG} (ci auto-bump)"
+          git push -f origin "$BRANCH"
+          printf '%s\n' "Automated image bump from minicloud-rag-ingest@${SHORT} (CI). Same service, new main build. Squash-merge to deploy — ArgoCD then auto-syncs the ai namespace. (rag-ingest is single-env / not on Kargo; restored per-repo auto-bump, ghcr-only, dropped at the Harbor decommission.)" > /tmp/bump-body.md
+          gh pr create --repo andrelair-platform/minicloud-gitops --base main --head "$BRANCH" \
+            --title "chore(rag-ingest): bump image to ${TAG}" \
+            --body-file /tmp/bump-body.md \
+            || echo "a bump PR for ${BRANCH} already exists — branch was updated"
