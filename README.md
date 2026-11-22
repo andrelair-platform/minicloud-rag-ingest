@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/Python-3.12-blue)](https://www.python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-teal)](https://fastapi.tiangolo.com)
 
-> A cluster-native RAG ingestion pipeline deployed as a Kubernetes service. Accepts any document, converts it to Markdown, splits it on French insurance structural boundaries, embeds each chunk, and inserts it directly into a pgvector knowledge base — with no local tools required.
+> A cluster-native RAG ingestion pipeline deployed as a Kubernetes service. Accepts any document, converts it to Markdown, splits it on French insurance structural boundaries, embeds each chunk, and upserts it directly into a Qdrant vector collection — with no local tools required.
 
 ---
 
@@ -42,48 +42,19 @@ The Open WebUI paperclip upload path converts and embeds documents inside the UI
 
 ## Architecture
 
-```
-Client (curl / CI / port-forward)
-        │
-        │  POST /ingest  (multipart: file + collection + source + doc_type)
-        ▼
-┌─────────────────────────────────────────────────────────┐
-│                     rag-ingest                          │
-│  FastAPI · python:3.12-slim · UID 1000 · port 8001      │
-│                                                         │
-│  1. Forward file to markitdown-proxy                    │
-│     ├─ images (png/jpg/tiff…) →  Docling (port 5001)   │
-│     └─ .pdf / .docx / .xlsx / .pptx / .html            │
-│                               →  MarkItDown (in-pod)    │
-│                                                         │
-│  2. Structure-aware chunker                             │
-│     Splits on: Article / Chapitre / Titre / Annexe      │
-│     / Section / Garantie / Disposition + Markdown h1–h3 │
-│     Oversized sections split further by paragraph       │
-│     Metadata per chunk: doc_type, section, article,     │
-│     source                                              │
-│                                                         │
-│  3. Embed via LiteLLM                                   │
-│     Model: text-embedding-3-small (1536-dim)            │
-│     Batch size: 64 chunks per call                      │
-│                                                         │
-│  4. INSERT into ragdb (pgvector)                        │
-│     Table: document_chunk                               │
-│     Index: HNSW (vector) + GIN FTS (french dictionary)  │
-└─────────────────────────────────────────────────────────┘
-        │                          │
-        ▼                          ▼
-markitdown-proxy            postgresql-ai (ragdb)
-ai namespace · port 8000    ai namespace · port 5432
-```
+![rag-ingest ingestion pipeline](docs/architecture/img/rag-ingest-pipeline.png)
+
+> **Pipeline:** `POST /ingest` → **1.** convert to Markdown (markitdown-proxy; scanned images via Docling OCR) → **2.** structure-aware chunk (FR legal boundaries) → **3.** embed via LiteLLM → **4.** **upsert into Qdrant** (collection = the Open WebUI Knowledge Base UUID; cosine; payload = `{text, document_type, section, article, source}`). Open WebUI then hybrid-searches that collection at retrieval time. Solid = principal flow · dashed = backing dependency.
+>
+> _Diagram is generated — `docs/diagrams/rag_ingest_pipeline.py` (mingrammer `diagrams` + Graphviz); edit the script, not the image._
 
 **In-cluster DNS names used at runtime:**
 
 | Dependency | Address | Source |
 |---|---|---|
 | markitdown-proxy | `http://markitdown-proxy.ai.svc.cluster.local:8000` | [`minicloud-markitdown-proxy`](https://github.com/andrelair-platform/minicloud-markitdown-proxy) — custom service |
-| LiteLLM (embeddings) | `http://litellm.ai.svc.cluster.local:4000` | Helm — `manifests/ai/` in minicloud-gitops |
-| PostgreSQL / ragdb | `postgresql-ai.ai.svc.cluster.local:5432` | Helm — `manifests/ai/` in minicloud-gitops |
+| LiteLLM (embeddings) | `http://litellm.ai.svc.cluster.local:4000` | Helm — `platform/ai/litellm/` in minicloud-gitops |
+| Qdrant (vector store) | `http://qdrant.ai.svc.cluster.local:6333` | Helm — `platform/ai/litellm/42-qdrant.yaml` in minicloud-gitops |
 
 **markitdown-proxy** itself calls a third service for scanned images:
 
@@ -97,13 +68,13 @@ ai namespace · port 8000    ai namespace · port 5432
 
 ### `POST /ingest`
 
-Ingest a document into the pgvector knowledge base.
+Ingest a document into a Qdrant vector collection.
 
 ```
 Content-Type: multipart/form-data
 
 file        required   Document to ingest
-collection  required   Open WebUI Knowledge Base UUID (collection_name in ragdb)
+collection  required   Open WebUI Knowledge Base UUID (the Qdrant collection name)
 source      required   Human-readable document title  (e.g. "Contrat RC Pro 2026")
 doc_type    optional   Document type tag (default: policy)
 ```
@@ -184,7 +155,7 @@ Each chunk carries:
 }
 ```
 
-This metadata is stored in the `vmetadata` JSONB column of `document_chunk` and is searchable via Open WebUI's hybrid search (BM25 + HNSW vector).
+This metadata is stored in each point's **Qdrant payload** (alongside the chunk `text`) and is usable for filtered retrieval and Open WebUI's hybrid search.
 
 ---
 
@@ -196,14 +167,15 @@ The service is designed to run in-cluster and depends on three in-cluster servic
 # 1. Port-forward all dependencies
 kubectl --context minicloud port-forward -n ai svc/markitdown-proxy 8000:8000 &
 kubectl --context minicloud port-forward -n ai svc/litellm 4000:4000 &
-kubectl --context minicloud port-forward -n ai svc/postgresql-ai 5432:5432 &
+kubectl --context minicloud port-forward -n ai svc/qdrant 6333:6333 &
 
 # 2. Run the service with env vars pointed at localhost
 PROXY_URL=http://localhost:8000 \
 LITELLM_BASE_URL=http://localhost:4000 \
 LITELLM_API_KEY=<litellm-master-key> \
-PG_HOST=localhost \
-PG_PASSWORD=<ragdb-password> \
+QDRANT_URL=http://localhost:6333 \
+QDRANT_API_KEY=<qdrant-api-key> \
+EMBED_MODEL=embeddings EMBED_DIM=1024 \
 uvicorn main:app --port 8001 --reload
 ```
 
@@ -234,41 +206,26 @@ The `collection` UUID is the Knowledge Base UUID from Open WebUI (Settings → K
 
 ## CI/CD pipeline
 
-Every push to `main` triggers `.github/workflows/ci.yml`:
+Every push to `main` triggers `.github/workflows/ci.yml` (**ghcr-only** — Harbor was decommissioned 2026-11-16; no Tailscale/Harbor steps):
 
 ```
 push to main
     │
-    ├─ 1. Connect to Tailscale (OAuth — TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET)
-    ├─ 2. Trust minicloud CA (raw PEM — no base64 decode)
-    ├─ 3. docker build → push to harbor.10.0.0.200.nip.io/library/rag-ingest:<sha>-amd64
-    ├─ 4. Trivy scan — fails on unfixed CRITICAL CVEs
-    ├─ 5. cosign sign (keyless — GitHub OIDC → Sigstore Fulcio)
-    └─ 6. GPG-signed commit to minicloud-gitops bumping manifests/ai/11-rag-ingest.yaml
-              └─ ArgoCD webhook → rolling update in ai namespace
+    ├─ 1. Login to ghcr.io (GITOPS_TOKEN — the package is linked to minicloud-gitops)
+    ├─ 2. docker build → push ghcr.io/andrelair-platform/rag-ingest:<sha>-amd64
+    ├─ 3. Trivy scan — fails on unfixed CRITICAL CVEs
+    └─ 4. cosign sign (keyless — GitHub OIDC → Sigstore Fulcio) + SBOM
 ```
 
-**Branch behaviour:**
+The deployed image tag is **pinned by hand** in `minicloud-gitops` (`platform/ai/litellm/11-rag-ingest.yaml`) — this repo does **not** auto-bump it (the old gitops-bump step was dropped with the Harbor decommission). To roll a new build to prod, update that manifest's `image:` to the new `<sha>` via a gitops PR.
 
-| Branch | Image tag | Cosign signed | GitOps bump |
-|---|---|---|---|
-| `main` | `<sha>-amd64` | yes | yes — `manifests/ai/11-rag-ingest.yaml` |
-| `staging` | `staging-<sha>-amd64` | yes | no |
-| `dev` | `dev-<sha>-amd64` | no | no |
-
-**Required repository secrets:**
-
-All 7 secrets are **org-level on `andrelair-platform`** (visibility: all). New repos inherit them automatically — no per-repo setup needed.
+**Required repository secrets** (org-level on `andrelair-platform`, inherited by public repos):
 
 | Secret | Purpose |
 |---|---|
-| `TS_OAUTH_CLIENT_ID` | Tailscale OAuth client ID — joins tailnet as `tag:ci` |
-| `TS_OAUTH_SECRET` | Tailscale OAuth secret |
-| `MINICLOUD_CA_CERT` | Self-signed CA PEM — lets Docker and cosign trust Harbor TLS |
-| `HARBOR_USER` | Harbor registry username |
-| `HARBOR_PASSWORD` | Harbor registry password |
-| `GITOPS_TOKEN` | GitHub PAT (`repo` scope) for committing to `minicloud-gitops` |
-| `GPG_PRIVATE_KEY` | Armored GPG private key for signing gitops commits (key `FD6D39D681DEFA34`) |
+| `GITOPS_TOKEN` | `write:packages` PAT — pushes to the ghcr package (linked to minicloud-gitops) |
+| `MINICLOUD_CA_CERT` | Self-signed CA PEM — baked into the image at build (`CA_CERT` build-arg), not for any registry |
+| `GPG_PRIVATE_KEY` | Armored GPG private key (key `FD6D39D681DEFA34`) |
 
 ---
 
@@ -279,11 +236,10 @@ All 7 secrets are **org-level on `andrelair-platform`** (visibility: all). New r
 | `PROXY_URL` | yes | — | markitdown-proxy base URL |
 | `LITELLM_BASE_URL` | yes | — | LiteLLM base URL |
 | `LITELLM_API_KEY` | yes | — | LiteLLM API key |
-| `PG_HOST` | yes | — | PostgreSQL host |
-| `PG_PASSWORD` | yes | — | PostgreSQL password for `aiplatform` user |
-| `PG_PORT` | no | `5432` | PostgreSQL port |
-| `PG_DB` | no | `ragdb` | Database name |
-| `PG_USER` | no | `aiplatform` | Database user |
+| `QDRANT_URL` | yes | — | Qdrant base URL (`http://qdrant.ai.svc.cluster.local:6333`) |
+| `QDRANT_API_KEY` | no | `""` | Qdrant API key (from the `qdrant-api-key` secret) |
+| `EMBED_MODEL` | no | `nomic-embed-text` | LiteLLM model alias (deployed: `embeddings` → mistral-embed, EU) |
+| `EMBED_DIM` | no | `768` | Embedding vector size — the Qdrant collection dimension (deployed: `1024`) |
 
 All required variables are injected at runtime via a Kubernetes Secret managed by External Secrets Operator (ESO), pulling from HashiCorp Vault. Nothing is hardcoded.
 
@@ -293,7 +249,7 @@ All required variables are injected at runtime via a Kubernetes Secret managed b
 
 - **Non-root runtime** — image runs as UID 1000 (`appuser`), no shell
 - **Supply chain** — every `main` image is Cosign-signed (keyless) and the gitops bump commit is GPG-signed
-- **Network isolation** — the `ai` namespace has default-deny ingress + egress NetworkPolicies; rag-ingest can only reach its declared dependencies (markitdown-proxy, LiteLLM, PostgreSQL) and is not exposed to the internet
+- **Network isolation** — the `ai` namespace has default-deny ingress + egress NetworkPolicies; rag-ingest can only reach its declared dependencies (markitdown-proxy, LiteLLM, Qdrant) and is not exposed to the internet
 - **No credentials in code** — all secrets injected via ESO + Vault at pod startup; zero hardcoded values
 - **GitOps delivery** — no direct `kubectl apply`; all deploys go through ArgoCD with audit trail
 
@@ -306,8 +262,8 @@ All required variables are injected at runtime via a Kubernetes Secret managed b
 | `POST /ingest` returns 502 | `markitdown-proxy` not reachable | Check `kubectl get pods -n ai` — markitdown-proxy must be Running; verify NetworkPolicy allows ai→ai traffic |
 | Response shows `chunks_stored: 0` | Document converted to empty Markdown | Check markitdown-proxy logs — the file may be a scanned image without text; try a PDF with selectable text |
 | LiteLLM embedding call fails | LiteLLM pod unreachable or API key expired | Check `kubectl logs -n ai -l app=rag-ingest`; port-forward LiteLLM and verify the API key |
-| pgvector `INSERT` fails | `document_chunk` table or index missing | Run schema migration in `postgresql-ai` — check `migrations/` for the CREATE TABLE statement |
-| CI fails: Harbor push rejected | Runner not on Tailscale tailnet | Ensure Tailscale OAuth step runs before Docker login |
+| Qdrant upsert fails | Qdrant unreachable, bad API key, or dimension mismatch | Check `kubectl get pods -n ai -l app=qdrant`; verify `QDRANT_API_KEY`; ensure `EMBED_DIM` matches the collection's vector size |
+| CI fails: ghcr push rejected (`permission_denied: write_package`) | Logged in with the repo `GITHUB_TOKEN`, but the package is linked to minicloud-gitops | Log in to ghcr with `GITOPS_TOKEN` (a `write:packages` PAT) |
 | Long ingest time for a large PDF | Expecting Docling OCR overhead | rag-ingest routes PDFs to MarkItDown (PyMuPDF), not Docling — check markitdown-proxy routing logic |
 
 ---
@@ -318,8 +274,8 @@ All required variables are injected at runtime via a Kubernetes Secret managed b
 |---|---|---|
 | **markitdown-proxy** | [`minicloud-markitdown-proxy`](https://github.com/andrelair-platform/minicloud-markitdown-proxy) | Document conversion layer — routes scanned images to Docling (OCR) and all other formats to MarkItDown in-pod; exposes the Docling-compatible `/v1/convert/file` API |
 | **Docling** | deployed via Helm in `ai` namespace | OCR backend for scanned images only — `ghcr.io/docling-project/docling-serve-cpu:v1.26.0`; 4.4 GB CPU image, all model weights bundled, zero internet egress at runtime; manifest at `manifests/ai/` in [minicloud-gitops](https://github.com/andrelair-platform/minicloud-gitops) |
-| **LiteLLM** | deployed via Helm in `ai` namespace | Embedding gateway — routes `text-embedding-3-small` calls to the cloud or local Ollama; manifest in minicloud-gitops |
-| **postgresql-ai / ragdb** | deployed via Helm in `ai` namespace | pgvector store — `document_chunk` table with HNSW vector index + GIN FTS index (`french` dictionary) |
+| **LiteLLM** | deployed via Helm in `ai` namespace | Embedding gateway — the `embeddings` alias routes to **mistral-embed** (EU, 1024-dim) for data-residency; manifest in minicloud-gitops |
+| **Qdrant** | deployed via Helm in `ai` namespace (`platform/ai/litellm/42-qdrant.yaml`) | Vector store — one collection per Open WebUI Knowledge Base (cosine; `text` + metadata in the point payload); the retrieval side (Open WebUI) reads it directly |
 
 ---
 

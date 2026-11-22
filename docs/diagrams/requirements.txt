@@ -1,0 +1,2 @@
+diagrams>=0.24,<0.26
+# system dep (NOT pip): graphviz — brew install graphviz / apt-get install -y graphviz
