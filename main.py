@@ -3,7 +3,8 @@ rag-ingest — cluster-native RAG ingestion service.
 
 Accepts a file upload, converts via markitdown-proxy (PDF→Docling,
 Office→MarkItDown), splits at French insurance structural boundaries,
-embeds with bge-m3 via Ollama, and inserts directly into ragdb.
+embeds with nomic-embed-text via LiteLLM → Ollama (768-dim), and
+upserts directly into Qdrant.
 
 All services are reached via their in-cluster DNS names — no port-forwards,
 no local dependencies.
@@ -21,7 +22,6 @@ API
 """
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -29,23 +29,23 @@ import tempfile
 import uuid
 from pathlib import Path
 
-import psycopg2
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from openai import OpenAI
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, PointStruct, VectorParams
 
 PROXY_URL        = os.environ["PROXY_URL"]         # markitdown-proxy.ai.svc.cluster.local:8000
 LITELLM_BASE_URL = os.environ["LITELLM_BASE_URL"]  # http://litellm.ai.svc.cluster.local:4000
 LITELLM_API_KEY  = os.environ["LITELLM_API_KEY"]
-PG_HOST          = os.environ["PG_HOST"]           # postgresql-ai.ai.svc.cluster.local
-PG_PORT          = int(os.getenv("PG_PORT", "5432"))
-PG_DB            = os.getenv("PG_DB", "ragdb")
-PG_USER          = os.getenv("PG_USER", "aiplatform")
-PG_PASSWORD      = os.environ["PG_PASSWORD"]
-EMBED_MODEL      = "text-embedding-3-small"
+QDRANT_URL       = os.environ["QDRANT_URL"]        # http://qdrant.ai.svc.cluster.local:6333
+QDRANT_API_KEY   = os.getenv("QDRANT_API_KEY", "")
+EMBED_MODEL      = os.getenv("EMBED_MODEL", "nomic-embed-text")
+EMBED_DIM        = int(os.getenv("EMBED_DIM", "768"))
 
 _embed_client = OpenAI(api_key=LITELLM_API_KEY, base_url=f"{LITELLM_BASE_URL}/v1")
+_qdrant       = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
 
 MAX_CHUNK_CHARS = 2000
 
@@ -136,30 +136,34 @@ def embed_batch(texts: list[str]) -> list[list[float]]:
 
 # ── Storage ────────────────────────────────────────────────────────────────────
 
+def _ensure_collection(name: str) -> None:
+    try:
+        _qdrant.get_collection(name)
+    except Exception:
+        _qdrant.create_collection(
+            collection_name=name,
+            vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+        )
+
+
 def store_chunks(chunks: list[dict], collection: str) -> int:
     texts = [c["text"] for c in chunks]
     log.info("  embedding %d chunks in batches of %d …", len(texts), EMBED_BATCH_SIZE)
     vectors = embed_batch(texts)
 
-    conn = psycopg2.connect(
-        host=PG_HOST, port=PG_PORT, dbname=PG_DB,
-        user=PG_USER, password=PG_PASSWORD,
-    )
-    cur = conn.cursor()
-    for chunk, vector in zip(chunks, vectors):
-        cur.execute(
-            """
-            INSERT INTO document_chunk (id, collection_name, text, vector, vmetadata)
-            VALUES (%s, %s, %s, %s::vector, %s)
-            ON CONFLICT (id) DO NOTHING
-            """,
-            (str(uuid.uuid4()), collection, chunk["text"],
-             json.dumps(vector), json.dumps(chunk["metadata"])),
+    _ensure_collection(collection)
+
+    # Deterministic point IDs from collection + text prefix — allows idempotent re-ingestion.
+    points = [
+        PointStruct(
+            id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{collection}:{chunk['text'][:200]}")),
+            vector=vector,
+            payload={"text": chunk["text"], **chunk["metadata"]},
         )
-    conn.commit()
-    cur.close()
-    conn.close()
-    return len(chunks)
+        for chunk, vector in zip(chunks, vectors)
+    ]
+    _qdrant.upsert(collection_name=collection, points=points)
+    return len(points)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -171,7 +175,11 @@ def health():
 
 @app.get("/ready")
 def ready():
-    return {"status": "ready"}
+    try:
+        _qdrant.get_collections()
+        return {"status": "ready"}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Qdrant unreachable: {exc}")
 
 
 @app.post("/ingest")
@@ -214,12 +222,12 @@ async def ingest(
     chunks = chunk_by_structure(markdown, source, doc_type)
     log.info("  chunked  → %d structural chunks", len(chunks))
 
-    # 3. Embed + store — run in a thread so the event loop stays free for health probes
+    # 3. Embed + upsert — run in a thread so the event loop stays free for health probes
     try:
         stored = await asyncio.to_thread(store_chunks, chunks, collection)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Storage failed: {exc}")
-    log.info("  stored   → %d chunks in ragdb collection %s", stored, collection)
+    log.info("  stored   → %d chunks in qdrant collection %s", stored, collection)
 
     return JSONResponse({
         "status": "ok",
